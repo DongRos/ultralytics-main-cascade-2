@@ -1,0 +1,81 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLO12s-Cascade-EALF (Optimized)
+# 核心改动: 
+# 1. 移除 Neck/Head 中的 P5 (Stride 32) 分支，大幅降低参数量 (参考 EMFE-YOLO)
+# 2. 引入 P2 (Stride 4) 高分辨层，专注微小目标
+# 3. Backbone P5 仅作为 GL_ContextBlock 的全局上下文输入，不参与检测计算
+
+# Parameters
+nc: 80 # number of classes
+scales: 
+  n: [0.50, 0.25, 1024] 
+  s: [0.50, 0.50, 1024] 
+  m: [0.50, 1.00, 512] 
+  l: [1.00, 1.00, 512] 
+  x: [1.00, 1.50, 512] 
+
+# YOLO12 Backbone (保持不变，以便加载预训练权重)
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]  # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4 (Backbone P2)
+  - [-1, 2, C3k2, [256, False, 0.25]] # 2 (Backbone P2) -> 供 Neck P2 使用
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]] # 4 (Backbone P3) -> 供 Neck P3 使用
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 4, A2C2f, [512, True, 4]] # 6 (Backbone P4) -> 供 Neck P4 使用
+  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
+  - [-1, 4, A2C2f, [1024, True, 1]] # 8 (Backbone P5) -> !! 仅作为 Context Global 输入，不进入 Neck !!
+
+# EALF-Style Neck (只做 P4-P3-P2 的融合)
+head:
+  # === FPN Top-down flow (P4 -> P3 -> P2) ===
+  # 注意：不再从 Layer 8 (P5) 开始，直接从 Layer 6 (P4) 开始
+
+  # P4 -> P3
+  - [6, 1, nn.Upsample, [None, 2, "nearest"]] # 9 Upsample P4 (如果集成了DySample，这里可换为 DySample)
+  - [[-1, 4], 1, Concat, [1]] # 10 cat backbone P3 (Layer 4)
+  - [-1, 2, A2C2f, [256, False, -1]] # 11 (Neck P3 融合层)
+
+  # P3 -> P2 (下探到极高分辨率)
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 12 Upsample Neck P3 (建议换 DySample)
+  - [[-1, 2], 1, Concat, [1]] # 13 cat backbone P2 (Layer 2)
+  - [-1, 2, C3k2, [128, False, 0.25]] # 14 (Neck P2 融合层 - 极小目标核心)
+
+  # === PANet Bottom-up flow (P2 -> P3 -> P4) ===
+  # 这一步将高分辨率细节回传给深层，但只回传到 P4，不再去 P5
+
+  # P2 -> P3
+  - [-1, 1, Conv, [128, 3, 2]] # 15 Downsample Neck P2
+  - [[-1, 11], 1, Concat, [1]] # 16 cat Neck P3 (Layer 11)
+  - [-1, 2, A2C2f, [256, False, -1]] # 17 (Final P3)
+
+  # P3 -> P4
+  - [-1, 1, Conv, [256, 3, 2]] # 18 Downsample Final P3
+  - [[-1, 6], 1, Concat, [1]]  # 19 cat Backbone P4 (Layer 6) -- 注意：这里直接cat骨干P4即可，或者cat FPN的特征
+  - [-1, 2, A2C2f, [512, False, -1]] # 20 (Final P4)
+
+  # === 你的三大创新点模块 (适配 3 尺度架构) ===
+
+  # [Stage 1: Coarse Detect]
+  # 输入: [Neck_P2, Final_P3, Final_P4] -> [14, 17, 20]
+  # 作用: 即使没有 P5，P4 (Stride 16) 的感受野对无人机图也足够大了
+  - [[14, 17, 20], 1, CoarseDetect, [nc]] # 21
+
+  # [Innovation 1: STN (DifferentiableGazeShift)]
+  # 输入: [Neck_P2, Final_P3, Final_P4]
+  # 输出: [P2_stn, P3_stn, P4_stn] (聚焦后的特征)
+  - [[14, 17, 20], 1, DifferentiableGazeShift, []] # 22
+
+  # [Innovation 2: Context Fusion (GL_ContextBlock)]
+  # 巧妙之处: 
+  # Local 输入: Layer 22 的第一个输出 (P2_stn, 分辨率最高，细节最足)
+  # Global 输入: Layer 8 (Backbone P5) -> 这里复用了被砍掉的 P5 层作为全局上下文！
+  # 这样既没有增加 P5 Neck 的参数，又利用了 P5 的全局语义。
+  - [[22, 8], 1, GL_ContextBlock, []] # 23 (Enhanced P2)
+
+  # [Stage 2: Fine Detect]
+  # 输入: [Enhanced_P2, Final_P3, Final_P4]
+  # 我们用增强后的 P2 替换原始 P2，P3 和 P4 保持原样辅助检测
+  - [[23, 17, 20], 1, Detect, [nc]] # 24
